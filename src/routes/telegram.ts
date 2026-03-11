@@ -66,9 +66,20 @@ router.post('/link', async (req: Request, res: Response) => {
 });
 
 // ─── POST /api/telegram/unlink ────────────────────────────────────────────────
-// Отвязывает Telegram от кошелька
-router.post('/unlink', authenticateWallet, async (req: AuthRequest, res: Response) => {
-    const wallet = req.user!.walletAddress;
+// Отвязывает Telegram от кошелька (по walletAddress)
+router.post('/unlink', async (req: Request, res: Response) => {
+    const { walletAddress } = req.body;
+    if (!walletAddress) {
+        res.status(400).json({ error: 'walletAddress required' });
+        return;
+    }
+
+    const wallet = walletAddress.toLowerCase();
+    const user = await prisma.user.findUnique({ where: { walletAddress: wallet } });
+    if (!user) {
+        res.status(404).json({ error: 'User not found' });
+        return;
+    }
 
     await prisma.user.update({
         where: { walletAddress: wallet },
