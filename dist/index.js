@@ -3,8 +3,12 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+
 const authModule = require("./routes/auth");
 const authRoutes = authModule.default || authModule;
+
+const userModule = require("./routes/user");
+const userRoutes = userModule.default || userModule;
 
 dotenv.config();
 
@@ -26,6 +30,7 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.use("/api/auth", authRoutes);
+app.use("/api/user", userRoutes);
 
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on 0.0.0.0:${PORT}`);
