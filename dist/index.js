@@ -42,28 +42,6 @@ app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ─── Debug DB ──────────────────────────────────────────────────────────────
-app.get('/api/debug-db', (_req, res) => {
-    try {
-        const url = process.env.DATABASE_URL || '';
-        const afterAt = url.includes('@') ? url.split('@')[1] : '';
-        const hostPart = afterAt ? afterAt.split('/')[0] : null;
-        const dbPart = url ? url.split('/').pop()?.split('?')[0] || null : null;
-
-        res.json({
-            hasDatabaseUrl: !!url,
-            dbHostPreview: hostPart,
-            dbNamePreview: dbPart,
-            frontendUrl: process.env.FRONTEND_URL || null
-        });
-    } catch (err) {
-        res.status(500).json({
-            error: 'debug-db failed',
-            details: err && err.message ? err.message : String(err)
-        });
-    }
-});
-
 // ─── Routes ────────────────────────────────────────────────────────────────
 app.use('/api/auth', auth_1.default);
 app.use('/api/user', user_1.default);
@@ -86,11 +64,22 @@ process.on('unhandledRejection', (err) => {
     console.error('unhandledRejection:', err);
 });
 
+// ─── Runtime DB debug ─────────────────────────────────────────────────────
+try {
+    const dbUrl = process.env.DATABASE_URL || '';
+    const dbUrlSafe = dbUrl
+        ? dbUrl.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:***@')
+        : 'DATABASE_URL is empty';
+
+    console.log('DATABASE_URL runtime =', dbUrlSafe);
+} catch (e) {
+    console.log('DATABASE_URL runtime parse failed');
+}
+
 // ─── Start ─────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`\n🧬 GENESIS Backend running on http://localhost:${PORT}`);
     console.log(`   Health: http://localhost:${PORT}/api/health`);
-    console.log(`   Debug DB: http://localhost:${PORT}/api/debug-db`);
     console.log(`   Allowed origins: ${allowedOrigins.join(', ')}\n`);
 });
 //# sourceMappingURL=index.js.map
