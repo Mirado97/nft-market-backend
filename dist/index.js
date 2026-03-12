@@ -3,6 +3,8 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+const authModule = require("./routes/auth");
+const authRoutes = authModule.default || authModule;
 
 dotenv.config();
 
@@ -22,6 +24,8 @@ app.get("/api/health", (_req, res) => {
         timestamp: new Date().toISOString()
     });
 });
+
+app.use("/api/auth", authRoutes);
 
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on 0.0.0.0:${PORT}`);
