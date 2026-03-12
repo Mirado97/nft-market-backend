@@ -10,6 +10,9 @@ const authRoutes = authModule.default || authModule;
 const userModule = require("./routes/user");
 const userRoutes = userModule.default || userModule;
 
+const telegramModule = require("./routes/telegram");
+const telegramRoutes = telegramModule.default || telegramModule;
+
 dotenv.config();
 
 const app = express();
@@ -31,6 +34,7 @@ app.get("/api/health", (_req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/user", userRoutes);
+app.use("/api/telegram", telegramRoutes);
 
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on 0.0.0.0:${PORT}`);
