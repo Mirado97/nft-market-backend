@@ -12,7 +12,7 @@ const user_1 = __importDefault(require("./routes/user"));
 const telegram_1 = __importDefault(require("./routes/telegram"));
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3001;
-const HOST = process.env.HOST || '0.0.0.0';  // ✅ Railway требует 0.0.0.0
+const HOST = '0.0.0.0';  // 🔥 ЖЁСТКИЙ хардкод для Railway
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
 app.use((0, cors_1.default)({
