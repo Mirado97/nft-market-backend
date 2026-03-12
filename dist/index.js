@@ -10,6 +10,7 @@ dotenv_1.default.config();
 const auth_1 = __importDefault(require("./routes/auth"));
 const user_1 = __importDefault(require("./routes/user"));
 const telegram_1 = __importDefault(require("./routes/telegram"));
+
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3001;
 
@@ -24,24 +25,9 @@ const allowedOrigins = [
 app.use((0, cors_1.default)({
     origin: function (origin, callback) {
         if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-            return;
+            return callback(null, true);
         }
-        callback(null, false);
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    optionsSuccessStatus: 200,
-}));
-
-app.options('*', (0, cors_1.default)({
-    origin: function (origin, callback) {
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-            return;
-        }
-        callback(null, false);
+        return callback(new Error(`Not allowed by CORS: ${origin}`));
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -60,6 +46,23 @@ app.get('/api/health', (_req, res) => {
 app.use('/api/auth', auth_1.default);
 app.use('/api/user', user_1.default);
 app.use('/api/telegram', telegram_1.default);
+
+// ─── Error handlers ────────────────────────────────────────────────────────
+app.use((err, _req, res, _next) => {
+    console.error('Unhandled app error:', err);
+    res.status(500).json({
+        error: 'Internal server error',
+        details: err && err.message ? err.message : String(err)
+    });
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('uncaughtException:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+    console.error('unhandledRejection:', err);
+});
 
 // ─── Start ─────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
