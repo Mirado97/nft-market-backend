@@ -1,167 +1,98 @@
-import { Router, Response } from 'express';
-import crypto from 'crypto';
-import prisma from '../utils/db';
-import { authenticateWallet, AuthRequest } from '../middleware/authWallet';
+import { Router, Request, Response } from 'express'
+import crypto from 'crypto'
+import db from '../utils/db'
+import { authenticateWallet } from '../middleware/authWallet'
 
-const router = Router();
+const router = Router()
 
-/**
- * GET /api/user/profile
- * Возвращает профиль текущего пользователя
- */
-router.get('/profile', authenticateWallet, async (req: AuthRequest, res: Response) => {
+function generateSessionToken() {
+    return crypto.randomBytes(32).toString('hex')
+}
+
+function addMinutes(date: Date, minutes: number) {
+    return new Date(date.getTime() + minutes * 60 * 1000)
+}
+
+router.get('/profile', authenticateWallet, async (req: Request, res: Response) => {
     try {
-        const user = await prisma.user.findUnique({
-            where: { walletAddress: req.user!.walletAddress },
-        });
-
-        if (!user) {
-            res.status(404).json({ error: 'User not found' });
-            return;
-        }
+        const user = await db.user.findUnique({ where: { walletAddress: (req as any).user.walletAddress } })
+        if (!user) { res.status(404).json({ error: 'User not found' }); return }
 
         res.json({
             id: user.id,
             walletAddress: user.walletAddress,
-            telegramId: user.telegramId?.toString() || null,
+            telegramId: user.telegramId ? user.telegramId.toString() : null,
             telegramUsername: user.telegramUsername,
             telegramLinkedAt: user.telegramLinkedAt,
-        });
+        })
     } catch (err: any) {
-        console.error('profile error:', err);
-        res.status(500).json({
-            error: 'profile failed',
-            details: err?.message || 'Unknown error',
-        });
+        res.status(500).json({ error: 'profile failed', details: err?.message })
     }
-});
+})
 
-/**
- * GET /api/user/generate-nonce
- * Генерирует nonce для привязки Telegram (с JWT)
- */
-router.get('/generate-nonce', authenticateWallet, async (req: AuthRequest, res: Response) => {
+router.get('/generate-nonce', authenticateWallet, async (req: Request, res: Response) => {
     try {
-        const wallet = req.user!.walletAddress;
-
-        const user = await prisma.user.findUnique({ where: { walletAddress: wallet } });
-        if (!user) {
-            res.status(404).json({ error: 'User not found' });
-            return;
-        }
+        const wallet = (req as any).user.walletAddress
+        const user = await db.user.findUnique({ where: { walletAddress: wallet } })
+        if (!user) { res.status(404).json({ error: 'User not found' }); return }
 
         if (user.telegramId) {
-            res.status(400).json({
-                error: 'Telegram already linked',
-                telegram: {
-                    id: user.telegramId.toString(),
-                    username: user.telegramUsername,
-                }
-            });
-            return;
+            res.status(400).json({ error: 'Telegram already linked', telegram: { id: user.telegramId.toString(), username: user.telegramUsername } })
+            return
         }
 
-        const nonce = crypto.randomBytes(24).toString('base64url');
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+        const nonce = generateSessionToken()
+        const expiresAt = addMinutes(new Date(), 10)
+        const botUsername = process.env.TG_BOT_USERNAME || process.env.TELEGRAM_BOT_USERNAME || 'GenesisProtocol_Bot'
 
-        await prisma.user.update({
-            where: { walletAddress: wallet },
-            data: { linkNonce: nonce, linkNonceExpiry: expiresAt },
-        });
+        await db.telegramLinkSession.create({
+            data: { token: nonce, type: 'TELEGRAM_LINK', status: 'PENDING', userId: user.id, walletAddress: user.walletAddress, expiresAt },
+        })
 
-        const botUsername = process.env.TG_BOT_USERNAME || 'GenesisProtocol_Bot';
-        const telegramLink = `https://t.me/${botUsername}/app?startapp=${nonce}`;
-
-        res.json({ nonce, expiresAt: expiresAt.toISOString(), telegramLink });
+        res.json({ nonce, expiresAt: expiresAt.toISOString(), telegramLink: `https://t.me/${botUsername}/app?startapp=${nonce}` })
     } catch (err: any) {
-        console.error('generate-nonce error:', err);
-        res.status(500).json({
-            error: 'generate-nonce failed',
-            details: err?.message || 'Unknown error',
-        });
+        res.status(500).json({ error: 'generate-nonce failed', details: err?.message })
     }
-});
+})
 
-/**
- * POST /api/user/generate-nonce-by-wallet
- * Генерирует nonce по walletAddress (без JWT)
- */
-router.post('/generate-nonce-by-wallet', async (req: any, res: Response) => {
+router.post('/generate-nonce-by-wallet', async (req: Request, res: Response) => {
     try {
-        const { walletAddress } = req.body;
+        const { walletAddress } = req.body
+        if (!walletAddress) { res.status(400).json({ error: 'walletAddress required' }); return }
 
-        if (!walletAddress) {
-            res.status(400).json({ error: 'walletAddress required' });
-            return;
-        }
-
-        const wallet = walletAddress.toLowerCase();
-
-        let user = await prisma.user.findUnique({ where: { walletAddress: wallet } });
-        if (!user) {
-            user = await prisma.user.create({ data: { walletAddress: wallet } });
-        }
+        const wallet = walletAddress.toLowerCase()
+        let user = await db.user.findUnique({ where: { walletAddress: wallet } })
+        if (!user) { user = await db.user.create({ data: { walletAddress: wallet } }) }
 
         if (user.telegramId) {
-            res.status(400).json({
-                error: 'Telegram already linked',
-                telegram: {
-                    id: user.telegramId.toString(),
-                    username: user.telegramUsername
-                }
-            });
-            return;
+            res.status(400).json({ error: 'Telegram already linked', telegram: { id: user.telegramId.toString(), username: user.telegramUsername } })
+            return
         }
 
-        const nonce = crypto.randomBytes(24).toString('base64url');
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+        const nonce = generateSessionToken()
+        const expiresAt = addMinutes(new Date(), 10)
+        const botUsername = process.env.TG_BOT_USERNAME || process.env.TELEGRAM_BOT_USERNAME || 'GenesisProtocol_Bot'
 
-        await prisma.user.update({
-            where: { walletAddress: wallet },
-            data: { linkNonce: nonce, linkNonceExpiry: expiresAt },
-        });
+        await db.telegramLinkSession.create({
+            data: { token: nonce, type: 'TELEGRAM_LINK', status: 'PENDING', userId: user.id, walletAddress: user.walletAddress, expiresAt },
+        })
 
-        const botUsername = process.env.TG_BOT_USERNAME || 'GenesisProtocol_Bot';
-        const telegramLink = `https://t.me/${botUsername}/app?startapp=${nonce}`;
-
-        res.json({ nonce, expiresAt: expiresAt.toISOString(), telegramLink });
+        res.json({ nonce, expiresAt: expiresAt.toISOString(), telegramLink: `https://t.me/${botUsername}/app?startapp=${nonce}` })
     } catch (err: any) {
-        console.error('generate-nonce-by-wallet error:', err);
-        res.status(500).json({
-            error: 'generate-nonce-by-wallet failed',
-            details: err?.message || 'Unknown error',
-        });
+        res.status(500).json({ error: 'generate-nonce-by-wallet failed', details: err?.message })
     }
-});
+})
 
-/**
- * POST /api/user/check-link
- * Проверяет статус привязки Telegram по walletAddress
- */
-router.post('/check-link', async (req: any, res: Response) => {
+router.post('/check-link', async (req: Request, res: Response) => {
     try {
-        const { walletAddress } = req.body;
+        const { walletAddress } = req.body
+        if (!walletAddress) { res.status(400).json({ error: 'walletAddress required' }); return }
 
-        if (!walletAddress) {
-            res.status(400).json({ error: 'walletAddress required' });
-            return;
-        }
-
-        const user = await prisma.user.findUnique({
-            where: { walletAddress: walletAddress.toLowerCase() },
-        });
-
-        res.json({
-            linked: !!user?.telegramId,
-            telegramUsername: user?.telegramUsername || null,
-        });
+        const user = await db.user.findUnique({ where: { walletAddress: walletAddress.toLowerCase() } })
+        res.json({ linked: !!(user && user.telegramId), telegramUsername: user?.telegramUsername || null })
     } catch (err: any) {
-        console.error('check-link error:', err);
-        res.status(500).json({
-            error: 'check-link failed',
-            details: err?.message || 'Unknown error',
-        });
+        res.status(500).json({ error: 'check-link failed', details: err?.message })
     }
-});
+})
 
-export default router;
+export default router

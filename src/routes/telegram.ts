@@ -1,146 +1,229 @@
-import { Router, Request, Response } from 'express';
-import { ethers } from 'ethers';
-import { Readable } from 'stream';
-import prisma from '../utils/db';
-import { validateTelegramInitData } from '../utils/validateTelegram';
-import { authenticateWallet, AuthRequest } from '../middleware/authWallet';
+import { Router, Request, Response, NextFunction } from 'express'
+import { ethers } from 'ethers'
+import { Readable } from 'stream'
+import crypto from 'crypto'
+import jwt from 'jsonwebtoken'
+import db from '../utils/db'
+import { validateTelegramInitData } from '../utils/validateTelegram'
 
-const router = Router();
-const BOT_TOKEN = () => process.env.BOT_TOKEN!;
+const router = Router()
 
-// ─── POST /api/telegram/link ──────────────────────────────────────────────────
-// Привязывает Telegram ID к кошельку через nonce
+const BOT_TOKEN = () => process.env.BOT_TOKEN || ''
+const JWT_SECRET = () => process.env.JWT_SECRET || ''
+
+interface JwtPayload {
+    userId: string
+    walletAddress?: string
+}
+
+function getBearerToken(req: Request): string | null {
+    const authHeader = req.headers.authorization
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return null
+    return authHeader.slice(7)
+}
+
+async function requireAuth(req: Request, res: Response, next: NextFunction) {
+    try {
+        const token = getBearerToken(req)
+        if (!token) { res.status(401).json({ error: 'Authorization token required' }); return }
+        const decoded = jwt.verify(token, JWT_SECRET()) as JwtPayload
+        const user = await db.user.findUnique({ where: { id: decoded.userId } })
+        if (!user) { res.status(401).json({ error: 'User not found' }); return }
+        ;(req as any).auth = { userId: user.id, walletAddress: user.walletAddress }
+        next()
+    } catch {
+        res.status(401).json({ error: 'Invalid or expired token' })
+    }
+}
+
+function generateSessionToken() {
+    return crypto.randomBytes(32).toString('hex')
+}
+
+function addMinutes(date: Date, minutes: number) {
+    return new Date(date.getTime() + minutes * 60 * 1000)
+}
+
+// POST /api/telegram/session/create
+router.post('/session/create', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const userId: string = (req as any).auth.userId
+        const walletAddress: string | null = (req as any).auth.walletAddress || null
+        const token = generateSessionToken()
+        const expiresAt = addMinutes(new Date(), 10)
+
+        const session = await db.telegramLinkSession.create({
+            data: { token, type: 'TELEGRAM_LINK', status: 'PENDING', userId, walletAddress, expiresAt },
+        })
+
+        res.json({
+            success: true,
+            token: session.token,
+            expiresAt: session.expiresAt,
+            deepLink: `https://t.me/${process.env.TELEGRAM_BOT_USERNAME}?start=${session.token}`,
+        })
+    } catch (err: any) {
+        res.status(500).json({ error: err.message })
+    }
+})
+
+// GET /api/telegram/session/:token
+router.get('/session/:token', async (req: Request, res: Response) => {
+    try {
+        const sessionToken = String(req.params['token'])
+
+        const session = await db.telegramLinkSession.findUnique({
+            where: { token: sessionToken },
+        })
+
+        if (!session) { res.status(404).json({ error: 'Session not found' }); return }
+
+        let linkedUser = null
+        if (session.userId) {
+            linkedUser = await db.user.findUnique({ where: { id: session.userId } })
+        }
+
+        const expired = session.expiresAt < new Date()
+        if (expired && session.status === 'PENDING') {
+            await db.telegramLinkSession.update({ where: { id: session.id }, data: { status: 'EXPIRED' } })
+        }
+
+        res.json({
+            success: true,
+            token: session.token,
+            type: session.type,
+            status: expired && session.status === 'PENDING' ? 'EXPIRED' : session.status,
+            expiresAt: session.expiresAt,
+            confirmedAt: session.confirmedAt,
+            consumedAt: session.consumedAt,
+            walletAddress: session.walletAddress,
+            telegramId: session.telegramId ? session.telegramId.toString() : null,
+            telegramUsername: session.telegramUsername || null,
+            user: linkedUser ? {
+                id: linkedUser.id,
+                walletAddress: linkedUser.walletAddress,
+                telegramId: linkedUser.telegramId ? linkedUser.telegramId.toString() : null,
+                telegramUsername: linkedUser.telegramUsername,
+                telegramLinkedAt: linkedUser.telegramLinkedAt,
+            } : null,
+        })
+    } catch (err: any) {
+        res.status(500).json({ error: err.message })
+    }
+})
+
+// POST /api/telegram/link
 router.post('/link', async (req: Request, res: Response) => {
-    const { initData, startParam } = req.body;
+    const { initData, startParam } = req.body
 
     if (!initData || !startParam) {
-        res.status(400).json({ error: 'initData and startParam required' });
-        return;
+        res.status(400).json({ error: 'initData and startParam required' }); return
     }
 
     try {
-        // 1. Валидация подписи Telegram
-        const tgUser = validateTelegramInitData(initData, BOT_TOKEN());
+        const tgUser = validateTelegramInitData(initData, BOT_TOKEN())
 
-        // 2. Поиск по nonce
-        const user = await prisma.user.findUnique({ where: { linkNonce: startParam } });
-        if (!user) {
-            res.status(404).json({ error: 'Link code not found' });
-            return;
-        }
-        if (user.linkNonceExpiry && user.linkNonceExpiry < new Date()) {
-            res.status(410).json({ error: 'Link code expired. Generate a new one on the website.' });
-            return;
-        }
+        const session = await db.telegramLinkSession.findUnique({
+            where: { token: String(startParam) },
+        })
 
-        // 3. Один TG = один кошелёк
-        const existingLink = await prisma.user.findUnique({
-            where: { telegramId: BigInt(tgUser.id) },
-        });
-        if (existingLink && existingLink.id !== user.id) {
-            res.status(409).json({ error: 'This Telegram account is already linked to another wallet' });
-            return;
+        if (!session) { res.status(404).json({ error: 'Link session not found' }); return }
+        if (session.type !== 'TELEGRAM_LINK') { res.status(400).json({ error: 'Invalid session type' }); return }
+        if (session.status !== 'PENDING') { res.status(409).json({ error: `Session is already ${session.status.toLowerCase()}` }); return }
+
+        if (session.expiresAt < new Date()) {
+            await db.telegramLinkSession.update({ where: { id: session.id }, data: { status: 'EXPIRED' } })
+            res.status(410).json({ error: 'Link session expired. Generate a new one.' }); return
         }
 
-        // 4. Привязка
-        await prisma.user.update({
-            where: { id: user.id },
+        const existingTelegramUser = await db.user.findUnique({ where: { telegramId: BigInt(tgUser.id) } })
+        if (existingTelegramUser && existingTelegramUser.id !== session.userId) {
+            res.status(409).json({ error: 'This Telegram account is already linked to another user' }); return
+        }
+
+        if (!session.userId) { res.status(400).json({ error: 'Session has no target user' }); return }
+
+        const updatedUser = await db.user.update({
+            where: { id: session.userId },
             data: {
                 telegramId: BigInt(tgUser.id),
                 telegramUsername: tgUser.username || null,
                 telegramLinkedAt: new Date(),
-                linkNonce: null,
-                linkNonceExpiry: null,
             },
-        });
+        })
+
+        await db.telegramLinkSession.update({
+            where: { id: session.id },
+            data: {
+                telegramId: BigInt(tgUser.id),
+                telegramUsername: tgUser.username || null,
+                confirmedAt: new Date(),
+                consumedAt: new Date(),
+                status: 'CONSUMED',
+            },
+        })
 
         res.json({
             success: true,
-            walletAddress: user.walletAddress,
-            message: 'Telegram successfully linked!',
-        });
+            message: 'Telegram successfully linked',
+            user: {
+                id: updatedUser.id,
+                walletAddress: updatedUser.walletAddress,
+                telegramId: updatedUser.telegramId ? updatedUser.telegramId.toString() : null,
+                telegramUsername: updatedUser.telegramUsername,
+                telegramLinkedAt: updatedUser.telegramLinkedAt,
+            },
+        })
     } catch (err: any) {
-        console.error('Telegram link error:', err.message);
-        res.status(401).json({ error: err.message });
+        res.status(401).json({ error: err.message })
     }
-});
+})
 
-// ─── POST /api/telegram/unlink ────────────────────────────────────────────────
-// Отвязывает Telegram от кошелька (по walletAddress)
-router.post('/unlink', async (req: Request, res: Response) => {
-    const { walletAddress } = req.body;
-    if (!walletAddress) {
-        res.status(400).json({ error: 'walletAddress required' });
-        return;
+// POST /api/telegram/unlink
+router.post('/unlink', requireAuth, async (req: Request, res: Response) => {
+    try {
+        const user = await db.user.findUnique({ where: { id: (req as any).auth.userId } })
+        if (!user) { res.status(404).json({ error: 'User not found' }); return }
+
+        await db.user.update({
+            where: { id: user.id },
+            data: { telegramId: null, telegramUsername: null, telegramLinkedAt: null },
+        })
+
+        res.json({ success: true, message: 'Telegram unlinked' })
+    } catch (err: any) {
+        res.status(500).json({ error: err.message })
     }
+})
 
-    const wallet = walletAddress.toLowerCase();
-    const user = await prisma.user.findUnique({ where: { walletAddress: wallet } });
-    if (!user) {
-        res.status(404).json({ error: 'User not found' });
-        return;
-    }
-
-    await prisma.user.update({
-        where: { walletAddress: wallet },
-        data: {
-            telegramId: null,
-            telegramUsername: null,
-            telegramLinkedAt: null,
-        },
-    });
-
-    res.json({ success: true, message: 'Telegram unlinked' });
-});
-
-// ─── POST /api/telegram/create-nft ───────────────────────────────────────────
-// Создаёт NFT из base64-картинки, присланной из Telegram Mini App
+// POST /api/telegram/create-nft
 router.post('/create-nft', async (req: Request, res: Response) => {
-    const { initData, base64Image } = req.body;
+    const { initData, base64Image } = req.body
 
-    // Проверка размера (примерно 10MB base64 ≈ 13.7MB строки)
     if (!base64Image || base64Image.length > 14 * 1024 * 1024) {
-        res.status(400).json({ error: 'Image missing or too large (max 10MB)' });
-        return;
+        res.status(400).json({ error: 'Image missing or too large (max 10MB)' }); return
     }
 
     try {
-        // 1. Валидация Telegram
-        const tgUser = validateTelegramInitData(initData, BOT_TOKEN());
+        const tgUser = validateTelegramInitData(initData, BOT_TOKEN())
 
-        // 2. Находим привязанный кошелёк
-        const user = await prisma.user.findUnique({
-            where: { telegramId: BigInt(tgUser.id) },
-        });
-        if (!user) {
-            res.status(403).json({ error: 'Wallet not linked. Link it on the website first.' });
-            return;
-        }
+        const user = await db.user.findUnique({ where: { telegramId: BigInt(tgUser.id) } })
+        if (!user) { res.status(403).json({ error: 'Wallet not linked. Link it on the website first.' }); return }
+        if (!user.walletAddress) { res.status(403).json({ error: 'No wallet connected for this user.' }); return }
 
-        // 3. PENDING запись
-        const nft = await prisma.nft.create({
-            data: { ownerId: user.id, status: 'PENDING' },
-        });
+        const nft = await db.nft.create({ data: { ownerId: user.id, status: 'PENDING' } })
+        res.json({ success: true, nftId: nft.id, status: 'PENDING' })
 
-        // 4. Отвечаем сразу — минт пойдёт в фоне
-        res.json({ success: true, nftId: nft.id, status: 'PENDING' });
-
-        // 5. Фоновый минт
-        mintInBackground(nft.id, user.walletAddress, base64Image, tgUser.username || String(tgUser.id));
+        void mintInBackground(nft.id, user.walletAddress, base64Image, tgUser.username || String(tgUser.id))
     } catch (err: any) {
-        console.error('Create NFT error:', err.message);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: err.message })
     }
-});
+})
 
-// ─── GET /api/telegram/nft/:id/status ─────────────────────────────────────────
-// Статус минта NFT (для поллинга из Mini App)
+// GET /api/telegram/nft/:id/status
 router.get('/nft/:id/status', async (req: Request, res: Response) => {
-    const nft = await prisma.nft.findUnique({ where: { id: req.params.id as string } });
-    if (!nft) {
-        res.status(404).json({ error: 'NFT not found' });
-        return;
-    }
+    const nft = await db.nft.findUnique({ where: { id: String(req.params['id']) } })
+    if (!nft) { res.status(404).json({ error: 'NFT not found' }); return }
 
     res.json({
         id: nft.id,
@@ -149,42 +232,24 @@ router.get('/nft/:id/status', async (req: Request, res: Response) => {
         txHash: nft.txHash,
         ipfsImageUri: nft.ipfsImageUri,
         ipfsMetaUri: nft.ipfsMetaUri,
-    });
-});
+    })
+})
 
-// ─── Background minting ──────────────────────────────────────────────────────
-async function mintInBackground(
-    nftId: string,
-    walletAddress: string,
-    base64Image: string,
-    creatorName: string
-) {
+async function mintInBackground(nftId: string, walletAddress: string, base64Image: string, creatorName: string) {
     try {
-        await prisma.nft.update({ where: { id: nftId }, data: { status: 'MINTING' } });
+        await db.nft.update({ where: { id: nftId }, data: { status: 'MINTING' } })
 
-        // 1. Base64 → Buffer
-        const imageBuffer = Buffer.from(
-            base64Image.replace(/^data:image\/\w+;base64,/, ''),
-            'base64'
-        );
-
-        // 2. Upload image to IPFS (Pinata)
-        let ipfsImageUri = '';
-        let ipfsMetaUri = '';
+        const imageBuffer = Buffer.from(base64Image.replace(/^data:image\/\w+;base64,/, ''), 'base64')
+        let ipfsImageUri = ''
+        let ipfsMetaUri = ''
 
         if (process.env.PINATA_API_KEY && process.env.PINATA_API_KEY !== 'your-pinata-api-key') {
-            const pinataSDK = require('@pinata/sdk');
-            const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECRET);
-
-            const stream = Readable.from(imageBuffer);
-            (stream as any).path = `nft_${nftId}.png`;
-
-            const imgResult = await pinata.pinFileToIPFS(stream, {
-                pinataMetadata: { name: `genesis-nft-image-${nftId}` },
-            });
-            ipfsImageUri = `ipfs://${imgResult.IpfsHash}`;
-
-            // 3. Upload metadata to IPFS
+            const pinataSDK = require('@pinata/sdk')
+            const pinata = new pinataSDK(process.env.PINATA_API_KEY, process.env.PINATA_SECRET)
+            const stream = Readable.from(imageBuffer) as Readable & { path?: string }
+            stream.path = `nft_${nftId}.png`
+            const imgResult = await pinata.pinFileToIPFS(stream, { pinataMetadata: { name: `genesis-nft-image-${nftId}` } })
+            ipfsImageUri = `ipfs://${imgResult.IpfsHash}`
             const metadata = {
                 name: `Genesis NFT #${nftId.slice(-6)}`,
                 description: `Created by ${creatorName} via Telegram Mini App`,
@@ -194,77 +259,45 @@ async function mintInBackground(
                     { trait_type: 'Platform', value: 'Telegram Mini App' },
                     { trait_type: 'Created', value: new Date().toISOString() },
                 ],
-            };
-
-            const metaResult = await pinata.pinJSONToIPFS(metadata, {
-                pinataMetadata: { name: `genesis-nft-meta-${nftId}` },
-            });
-            ipfsMetaUri = `ipfs://${metaResult.IpfsHash}`;
+            }
+            const metaResult = await pinata.pinJSONToIPFS(metadata, { pinataMetadata: { name: `genesis-nft-meta-${nftId}` } })
+            ipfsMetaUri = `ipfs://${metaResult.IpfsHash}`
         } else {
-            // DEV mode: пропускаем IPFS, используем placeholder
-            console.warn('[DEV] Skipping IPFS upload — PINATA_API_KEY not configured');
-            ipfsImageUri = `ipfs://dev-placeholder-image-${nftId}`;
-            ipfsMetaUri = `ipfs://dev-placeholder-meta-${nftId}`;
+            ipfsImageUri = `ipfs://dev-placeholder-image-${nftId}`
+            ipfsMetaUri = `ipfs://dev-placeholder-meta-${nftId}`
         }
 
-        // 4. Mint on blockchain
-        let txHash = '';
-        let tokenId: number | null = null;
+        let txHash = ''
+        let tokenId: number | null = null
 
-        if (
-            process.env.MINTER_PRIVATE_KEY &&
-            process.env.MINTER_PRIVATE_KEY !== '0x0000000000000000000000000000000000000000000000000000000000000000'
-        ) {
-            const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-            const signer = new ethers.Wallet(process.env.MINTER_PRIVATE_KEY, provider);
+        if (process.env.MINTER_PRIVATE_KEY && process.env.MINTER_PRIVATE_KEY !== '0x0000000000000000000000000000000000000000000000000000000000000000') {
+            const provider = new ethers.JsonRpcProvider(process.env.RPC_URL)
+            const signer = new ethers.Wallet(process.env.MINTER_PRIVATE_KEY, provider)
             const contract = new ethers.Contract(
-                process.env.NFT_CONTRACT!,
+                process.env.NFT_CONTRACT as string,
                 ['function safeMint(address to, string memory uri) public returns (uint256)'],
                 signer
-            );
-
-            const tx = await contract.safeMint(walletAddress, ipfsMetaUri);
-            const receipt = await tx.wait();
-            txHash = tx.hash;
-
-            // Извлекаем tokenId из Transfer event
+            )
+            const tx = await contract.safeMint(walletAddress, ipfsMetaUri)
+            const receipt = await tx.wait()
+            txHash = tx.hash
             const transferLog = receipt.logs.find((log: any) => {
-                try {
-                    return contract.interface.parseLog(log)?.name === 'Transfer';
-                } catch {
-                    return false;
-                }
-            });
+                try { return contract.interface.parseLog(log)?.name === 'Transfer' } catch { return false }
+            })
             if (transferLog) {
-                const parsed = contract.interface.parseLog(transferLog);
-                tokenId = Number(parsed?.args?.tokenId);
+                const parsed = contract.interface.parseLog(transferLog)
+                tokenId = Number(parsed?.args?.tokenId)
             }
         } else {
-            console.warn('[DEV] Skipping blockchain mint — MINTER_PRIVATE_KEY not configured');
-            txHash = `0xdev_${nftId}`;
-            tokenId = Math.floor(Math.random() * 10000);
+            txHash = `0xdev_${nftId}`
+            tokenId = Math.floor(Math.random() * 10000)
         }
 
-        // 5. Update DB
-        await prisma.nft.update({
-            where: { id: nftId },
-            data: {
-                ipfsImageUri,
-                ipfsMetaUri,
-                txHash,
-                tokenId,
-                status: 'MINTED',
-            },
-        });
-
-        console.log(`✅ NFT ${nftId} minted: tokenId=${tokenId}, tx=${txHash}`);
+        await db.nft.update({ where: { id: nftId }, data: { ipfsImageUri, ipfsMetaUri, txHash, tokenId, status: 'MINTED' } })
     } catch (err) {
-        console.error(`❌ Mint failed for NFT ${nftId}:`, err);
-        await prisma.nft.update({
-            where: { id: nftId },
-            data: { status: 'FAILED' },
-        });
+        console.error(`Mint failed for NFT ${nftId}:`, err)
+        await db.nft.update({ where: { id: nftId }, data: { status: 'FAILED' } })
     }
 }
 
-export default router;
+export default router
